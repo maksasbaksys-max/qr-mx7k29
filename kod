@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QR Relay</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<style>
+html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden; }
+body { font: 15px/1.4 system-ui, sans-serif; touch-action: none; }
+video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; transform-origin: center; }
+#msg {
+  position: fixed; left: 16px; right: 16px; bottom: max(24px, env(safe-area-inset-bottom));
+  text-align: center; padding: 10px 14px; border-radius: 10px;
+  background: rgba(0,0,0,.6); word-break: break-all;
+}
+#msg:empty { display: none; }
+#msg.ok { background: rgba(31,138,76,.9); }
+#msg.bad { background: rgba(196,59,59,.95); bottom: auto; top: max(16px, env(safe-area-inset-top)); font-weight: 600; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<div id="msg">Tap to start camera</div>
+<canvas id="canvas" hidden></canvas>
+
+<script>
+const WEBHOOK = "https://discord.com/api/webhooks/1558538243237224549/W8U1JxB574LVyWNGX5fC-wg2bT1oby4XqRCpgo8Kf6xCCppOZ0RK_zd8m2MU6bRaRjOO";
+const ALLOWED_HOST = "moodle.vilniustech.lt";
+
+const video = document.getElementById("video"), msgEl = document.getElementById("msg");
+const canvas = document.getElementById("canvas"), ctx = canvas.getContext("2d", { willReadFrequently: true });
+let stream = null, track = null, nativeZoom = false, digital = 1, zoom = 1, zmin = 1, zmax = 5;
+const sent = new Set();
+let lastBad = null, hideTimer;
+
+function msg(text, kind = "", ms = 0) {
+  msgEl.textContent = text; msgEl.className = kind;
+  clearTimeout(hideTimer);
+  if (ms) hideTimer = setTimeout(() => { msgEl.textContent = ""; }, ms);
+}
+
+function isAllowed(t) {
+  try { const u = new URL(t); return /^https?:$/.test(u.protocol) && u.hostname.toLowerCase() === ALLOWED_HOST; }
+  catch { return false; }
+}
+
+async function send(link) {
+  sent.add(link);
+  msg("Sending…");
+  try {
+    const r = await fetch(WEBHOOK, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: link }) });
+    if (!r.ok) throw new Error(r.status);
+    if (navigator.vibrate) navigator.vibrate(80);
+    msg("Sent ✓ Opening…", "ok");
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    setTimeout(() => location.assign(link), 400);
+  } catch (e) {
+    sent.delete(link); // allow a retry on the next scan
+    msg("Couldn't send" + (e.message ? " (" + e.message + ")" : "") + ". Scan again.", "bad", 4000);
+  }
+}
+
+function onCode(t) {
+  if (sent.has(t)) return;
+  if (!isAllowed(t)) {
+    if (t !== lastBad) { lastBad = t; msg("Not a Moodle link", "bad", 2500); }
+    return;
+  }
+  send(t);
+}
+
+function tick() {
+  if (!stream) return;
+  if (video.readyState >= 2) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const sw = vw / digital, sh = vh / digital;
+    const s = Math.min(1, 640 / Math.max(sw, sh));
+    const w = Math.round(sw * s), h = Math.round(sh * s);
+    canvas.width = w; canvas.height = h;
+    ctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, w, h);
+    const code = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" });
+    if (code) onCode(code.data.trim());
+  }
+  requestAnimationFrame(tick);
+}
+
+async function start() {
+  if (stream) return;
+  if (!window.isSecureContext || !navigator.mediaDevices) { msg("Open this from an https:// link to use the camera", "bad"); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    video.srcObject = stream; await video.play();
+    track = stream.getVideoTracks()[0];
+    const c = track.getCapabilities ? track.getCapabilities() : {};
+    if (c.zoom && c.zoom.max > c.zoom.min) { nativeZoom = true; zmin = c.zoom.min; zmax = c.zoom.max; zoom = track.getSettings().zoom || zmin; }
+    msg("");
+    tick();
+  } catch {
+    stream = null;
+    msg("Camera blocked. Allow it in Chrome's site settings, then tap here.", "bad");
+  }
+}
+
+function setZoom(v) {
+  zoom = Math.min(zmax, Math.max(zmin, v));
+  if (nativeZoom) track.applyConstraints({ advanced: [{ zoom }] }).catch(() => {});
+  else { digital = zoom; video.style.transform = `scale(${zoom})`; }
+}
+
+// pinch to zoom
+let pinch = null;
+const dist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+addEventListener("touchstart", e => { if (e.touches.length === 2) pinch = { d: dist(e.touches), z: zoom }; }, { passive: true });
+addEventListener("touchmove", e => { if (pinch && e.touches.length === 2) { e.preventDefault(); setZoom(pinch.z * dist(e.touches) / pinch.d); } }, { passive: false });
+addEventListener("touchend", () => { pinch = null; });
+
+// show any unexpected error at the top
+addEventListener("error", e => msg("Error: " + (e.message || "something went wrong"), "bad"));
+addEventListener("unhandledrejection", e => msg("Error: " + ((e.reason && e.reason.message) || e.reason || "something went wrong"), "bad"));
+addEventListener("offline", () => msg("No internet connection", "bad"));
+addEventListener("online", () => msg("Back online", "ok", 2000));
+if (typeof jsQR !== "function") msg("QR reader didn't load. Check your internet and reload the page.", "bad");
+
+addEventListener("click", start);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  else if (!document.hidden) start();
+});
+start();
+</script>
+</body>
+</html>
